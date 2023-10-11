@@ -1,7 +1,7 @@
 
 //////////////////////////
 //Definiciones para los puertos cereales
-//MQTT_0
+//MQTT
 #define RXD1 16 //pin RX para serial del modem
 #define TXD1 17 //pin TX para serial del modem
 #define pinRele 19 //pin para activar el relé//
@@ -35,7 +35,7 @@
 
 
 //Se definen comandos para funcionalidad
-#define MQTT_REINICIO "NXTCODEON" //Cadena a buscar para efectuar un reinicio
+//#define MQTT_REINICIO "NXTCODEON" //Cadena a buscar para efectuar un reinicio
 
 
 //AQUI ESTA EL PARAMETRO DE REINICIO
@@ -47,6 +47,12 @@
 
 
 /////////////////////////////////////////////////////////
+//Definiciones para la decodificación de los comandos enviados mediante el broker MQTT
+
+#define MQTT_NOACCION 0
+#define MQTT_CFGHORA  1
+#define MQTT_CFGPERI  2
+#define MQTT_REINICIO 3
 
 //Definiciones para logica de firmware
 /////////////////////////////////////////////////////////
@@ -154,28 +160,29 @@ void setup() {
 
 void loop(){
 
-  /*if(desMQTT){
-    desMQTT = false;
-    disMQTT();
-  }*/
-
-  
 
   if(Serial1.available() > 0){
     //Significa que el modem recibio algo, se decodifica qué es 
 
     Serial1.find("+"); //Nos ponemos al inicio de la respuesta del modem 
 
-    modemAT = Serial1.readString();
+    modemAT = Serial1.readStringUntil(':');
 
-    Serial.println();
+    Serial.println(); //OPCIONAL quitar, solo para formato de pruebas
     Serial.println(modemAT);
 
-    //if(modemAT == "CMQTTRXSTART"){
-    if(true){
+    if(modemAT == "CMQTTRXSTART"){
       //Entonces se trata de un payload por parte del HOST
 
-      //hasta el momento el unico payload implica que se requiere un reinicio remoto del dispositivo conectado
+      accionMQTT(decodificarComando());
+
+      
+
+ 
+
+
+
+
 
       //Se agrega la rutina de reiniciar por 30 + 1 segundos lo que este conectado
       //al terminar se 'limpia' el buffer
@@ -890,8 +897,96 @@ void pubMQTT(String mensaje){
 }
 
 
+uint16_t decodificarComando(){
+
+  /*
+  *
+  * Funcion para decodificar los comandos recibidos a través del Broker de Losant
+  * Devuelve la acción que debe efectuarse basado en el comando enviado
+  *
+  * Los comandos implementados hasta el momento son:
+  * 1.- $CFGHORA@HH
+  *     HH: Hora en formato de 24h
+  *
+  * 2.- $CFGPER@DD
+  *     DD: Días que transcurren entre reinicios periodicos
+  *
+  * 3.- $RE@
+  *     Da la instruccion de hacer el reinicio 
+  *
+  */
+
+  //Nos acercamos al inicio del comando buscando nuestro caracter de inicio '$'
+  Serial1.find('$');
+
+  //Ahora estamos al inicio del comando, lo leemos
+  String comando = Serial1.readStringUntil('@');
+
+  if(comando == "CFGHORA"){
+    //Se trata de una configuracion de hora, se obtiene a que hora se requiere el reinicio
+    Serial.println();
+    Serial.println("Configuracion de hora");
+
+    //Rescatamos la hora 
+    cfgHora = Serial1.parseInt();
+
+    Serial.print("Hora de reinicio:");
+
+    Serial.println(cfgHora);
+
+    //Limpiamos buffer
+    Serial1.readString();
 
 
+
+
+
+  }else if(comando == "CFGPER"){
+
+  }else if(comando == "CFGPING"){
+
+  }else if(comando == "RE"){
+
+    Serial.println("Reinicio pendiente");
+
+    return MQTT_REINICIO;
+
+  }else{
+    Serial.println("COMANDO NO DETECTADO");
+
+    return MQTT_NOACCION;
+
+  }
+
+
+
+
+}
+
+bool accionMQTT(uint16_t com){
+
+  switch(com){
+
+    case MQTT_REINICIO: 
+      //Habilitamos el reinicio
+      reinicioSerie = true; 
+      break;
+    /*case
+      break;
+    case
+      break;
+    case
+      break;*/
+    
+    default:
+      Serial.println("Sin accion, comando desconocido");
+
+      return false;
+      //break;
+
+  }
+  return true;
+}
 
 
 
