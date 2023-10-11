@@ -1,0 +1,9 @@
+
+
+v1	(11/10/23)
+	-Funcionalidad correcta
+	-Conexion a Broker de Losant (parametrizado)
+	-publicacion y recepcion de mensajes en diferentes temas del broker
+	-reinicios periodicos cada día
+	-envio de "PINGS" cada 10 minutos
+	-Reconexión automatica si se desconecta
