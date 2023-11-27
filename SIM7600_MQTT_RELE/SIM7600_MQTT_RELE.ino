@@ -28,10 +28,10 @@
 /////////////////////
 
 //TEMA DE SUSCRIPCION
-#define MQTT_SUBTOPIC "SIM7600/TEST/SUB"
+#define MQTT_SUBTOPIC "NXT/MQTT_TEST/SUB"
 
 //TEMA DE PUBLICACION
-#define MQTT_DEVICEPUB "SIM7600/TEST/PUB"
+#define MQTT_DEVICEPUB "NXT/MQTT_TEST/PUB"
 
 
 //Se definen comandos para funcionalidad
@@ -39,7 +39,7 @@
 
 
 //AQUI ESTA EL PARAMETRO DE REINICIO
-#define hrspReinicio 24
+#define hrspReinicio 3
 
 //Definiciones para timers
 /////////////////////////////////////////////////////////
@@ -53,6 +53,7 @@
 #define MQTT_CFGHORA  1
 #define MQTT_CFGPERI  2
 #define MQTT_REINICIO 3
+#define MQTT_PING     4
 
 //Definiciones para logica de firmware
 /////////////////////////////////////////////////////////
@@ -72,7 +73,7 @@ hw_timer_t *tAux = NULL; //Timer para diversas funciones
 hw_timer_t *tMonitoreo = NULL; //Timer periodico que habilita la reconexion a MQTT
 
 /////////////////////////////////////////
-byte horasReinicio = 0; //contador de las horas de reinicio
+unsigned long horasReinicio = 0; //contador de las horas de reinicio
 
 //variables parametricas para configurar funcionalidad
 int cfgDias = 15; //Dias que deben transcurrir para reinicio periodico
@@ -176,32 +177,7 @@ void loop(){
 
       accionMQTT(decodificarComando());
 
-      
-
- 
-
-
-
-
-
-      //Se agrega la rutina de reiniciar por 30 + 1 segundos lo que este conectado
-      //al terminar se 'limpia' el buffer
-      if(Serial1.find(MQTT_REINICIO)){
-      
-      
-      reinicioSerie = true; //indicamos que debe de hacerse un reinicio
-
-
-      }else{
-        //APAGAMOS RELE
-        digitalWrite(pinRele,LOW);
-
-      }
-      //limpiamos buffer
-      Serial1.readString();
-
-
-    }else if(Serial1.find("CMQTTNONET")){
+    }else{//else if(Serial1.find("CMQTTNONET")){
       //Vamos a buscar entonces si hay un +CMQTTNONET que indique desconexión del servicio
       Serial1.readString(); //LImpieza de buffer
 
@@ -227,16 +203,18 @@ void loop(){
     Serial1.readString(); //Limpieza del buffer
 
   }
-  //Seccion que se encarga de ver si es que se debe hacer un reinicio al WattWatcher
+  //Seccion que se encarga de ver si es que se debe  hacer un reinicio al WattWatcher
   if(reinicioSerie || reinicioInt ){
     //Si cualquiera de los dos triggers indica reinicio de wattWatcher se reinicia
-    
+    String tipoD = "";
     if(reinicioInt){
       Serial.println("Reinicio por INT");
+      tipoD = "REINICIO DE WW POR INT";
     }
 
     if(reinicioSerie){
       Serial.println("Reinicio por MQTT");
+      tipoD = "REINICIO DE WW POR MQTT";
     }
 
     
@@ -258,7 +236,7 @@ void loop(){
     }
     */
 
-    //Encendemos rele
+    //Apagamos rele
     digitalWrite(pinRele,0);
 
 
@@ -266,7 +244,7 @@ void loop(){
     Serial1.println("AT+CSQ");
     Serial1.find("+CSQ: ");
     String senial = Serial1.readStringUntil(',');
-    pubMQTT("{\"estado\":\"Reinico de WW\",\"senial\":"+senial+"}");
+    pubMQTT("{\"estado\":\""+tipoD+"\",\"senial\":"+senial+"}");
 
     Serial1.readString(); //Limpieza del buffer
     
@@ -327,7 +305,7 @@ void loop(){
           Serial1.println("AT+CSQ");
           Serial1.find("+CSQ: ");
           String senial = Serial1.readStringUntil(',');
-          pubMQTT("{\"estado\":\"Reconexion\",\"senial\":"+senial+"}");
+          pubMQTT("{\"estado\":\"RECONEXION\",\"senial\":"+senial+"}");
 
           Serial1.readString(); //Limpieza del buffer
         }
@@ -370,11 +348,11 @@ bool mdmWarmUp(){
   //Agregamos un timeout de 30s, el modem toma alrededor de 20s una vez se ha energizado para empezar a
   //recibir comandos AT de forma efectiva 
   Serial1.setTimeout(30000);
-
+  Serial.println("COMENZAMOS");
   //Buscamos la cadena 'RDY' ya que es la respuesta que entrega el modem al reiniciarse
   if(!Serial1.find("RDY")){
     //Si caemos en este bloque significa que el mdoem ya se encontraba encendido
-    
+    Serial.println("RDY");
   }
   //1.- Reiniciar el modem a configuracion predeterminada
   Serial1.setTimeout(1000);
@@ -710,7 +688,7 @@ void ISR_reconexion(){
 
   habReconexion = true; //permitimos intento de reconexion
 
-  habPING = true; //Habilitamos envio de PING
+  //habPING = true; //Habilitamos envio de PING
 
 }
 
@@ -914,6 +892,8 @@ uint16_t decodificarComando(){
   * 3.- $RE@
   *     Da la instruccion de hacer el reinicio 
   *
+  * 4.- $PING@
+  *     Solicitamos estado de conexion del dispositivo
   */
 
   //Nos acercamos al inicio del comando buscando nuestro caracter de inicio '$'
@@ -949,7 +929,18 @@ uint16_t decodificarComando(){
 
     Serial.println("Reinicio pendiente");
 
+    //Limpieza de buffer
+    Serial1.readString();
+
     return MQTT_REINICIO;
+
+  }else if(comando == "PING"){
+
+    Serial.println();
+    Serial.println("Comprobando estado de conectividad");
+    Serial1.readString();
+
+    return MQTT_PING;
 
   }else{
     Serial.println("COMANDO NO DETECTADO");
@@ -970,6 +961,11 @@ bool accionMQTT(uint16_t com){
     case MQTT_REINICIO: 
       //Habilitamos el reinicio
       reinicioSerie = true; 
+      break;
+    
+    case MQTT_PING:
+      //Habilitamos ping
+      habPING = true;
       break;
     /*case
       break;
