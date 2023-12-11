@@ -57,7 +57,7 @@
 
 //Definiciones para logica de firmware
 /////////////////////////////////////////////////////////
-bool reinicioSerie = false; //Variable que define si hay que reiniciar (desde puerto serie=)
+bool reinicioSerie = false; //Variable que define si hay que reiniciar (desde puerto serie3)
 bool reinicioInt = false; //variable que define si hay reinicio (desde ISR de timer)
 bool habReconexion = false; //variable que permite o no hacer un intento de reconexión a MQTT
 
