@@ -1,9 +1,1255 @@
+
+//INCLUDES para medicion de temperatura 
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+//INCLUDES PARA OTA
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
+//DEFINICIONES PARA OTA
+const char* ssid = "red_programacion";
+const char* password = "0123456789";
+
+bool OTA = false; //indicador de si se está en modo OTA
+/////////////////////////////////////////
+
+//Definiciones para parpadeo de LED
+
+#define LedOpNormal 1000000 //Parpadeo de 1Hz
+#define LedOpTrans  1       //Encendido continuo
+#define LedOpOTA    50000   //Parpadeo rápido de 20Hz
+
+//PROVISIONAL
+#define LedOpRDY    40000   //Parpadeo más rápido para saber si se entro a OTA
+
+
+//////////////////////////
+//Definiciones para los puertos cereales
+//MQTT
+#define RXD1      16 //pin RX para serial del modem
+#define TXD1      17 //pin TX para serial del modem
+#define pinRele   19 //pin para activar el relé//
+#define pinLED    32 //pin de LED indicador (VERDE)
+#define pinReedSw 33 //pin de entrada Reed Switch
+
+/*/////////////////////////
+* ESP32THING GPIO 0 btn con PULLUP
+* NODEMCU32S ??????
+* FEATHER32  SIN BOTON INTEGRADO
+*/
+//#define pinBtn 18 //pin para boton integrado en tarjeta
+
+#define INTENTOS 3 //Maximo numero de intentos
+
+//Definiciones para el MQTT
+/////////////////////////////////////////////////////////
+#define MQTT_HOST   "broker.losant.com" //Broker de losant
+#define MQTT_PUERTO "1883" //Puerto del broker
+
+/////////////////////
+//Parametros de MQTT
+#define MQTT_ID   "" //Identificador del device registrado
+#define MQTT_USER "" //Usuario (ACCESS KEY de Losant)
+#define MQTT_PASS "" //Contraseña (ACCESS SECRET de Losant)
+/////////////////////
+
+//TEMA DE SUSCRIPCION
+#define MQTT_SUBTOPIC "NXT/MQTT/SUB"
+
+//TEMA DE PUBLICACION
+#define MQTT_DEVICEPUB "NXT/MQTT/PUB"
+
+
+//Se definen comandos para funcionalidad
+//#define MQTT_REINICIO "NXTCODEON" //Cadena a buscar para efectuar un reinicio
+
+//DEFINICIONES DE SENSOR DE TEMEPRATURA
+#define ONE_WIRE_BUS 2
+#define TEMPERATURE_PRECISION 9 // Lower resolution
+
+//AQUI ESTA EL PARAMETRO DE REINICIO
+#define hrspReinicio 3
+
+//Definiciones para timers
+/////////////////////////////////////////////////////////
+#define hrsReinicio 3600  //Dias expresadas en horas para reinicio periodico
+
+
+/////////////////////////////////////////////////////////
+//Definiciones para la decodificación de los comandos enviados mediante el broker MQTT
+
+#define MQTT_NOACCION 0
+#define MQTT_CFGHORA  1
+#define MQTT_CFGPERI  2
+#define MQTT_REINICIO 3
+#define MQTT_PING     4
+
+//Definiciones para logica de firmware
+/////////////////////////////////////////////////////////
+bool reinicioSerie = false; //Variable que define si hay que reiniciar (desde puerto serie3)
+bool reinicioInt = false; //variable que define si hay reinicio (desde ISR de timer)
+bool habReconexion = false; //variable que permite o no hacer un intento de reconexión a MQTT
+
+bool MQTTconectado = false; //variable para saber si estamos conectados a broker de losant
+
+/////////////////////////////////////////////////////////
+String modemAT = ""; //Variable que captura el comando AT del modem
+
+////////////////////////////////////////
+/*Variables para los Hardware Timers  */
+hw_timer_t *tReinicio = NULL; //timer para contar el tiempo hasta el reinicio
+//hw_timer_t *tAux = NULL; //Timer para diversas funciones SIN USO
+hw_timer_t *tLED = NULL; //Timer para controlar comportamiento de LED indicador 
+hw_timer_t *tWD = NULL; //Watchdog para rutina de programación OTA (entrar y salir de ella)
+
+
+/////////////////////////////////////////
+unsigned long horasReinicio = 0; //contador de las horas de reinicio
+
+//variables parametricas para configurar funcionalidad
+int cfgDias = 15; //Dias que deben transcurrir para reinicio periodico
+
+int cfgHora = 12; //Hora en formato de 24 horas para realizar el reinicio
+int cfgMin  = 0; //Minuto en el que se debe realizar el reinicio
+
+bool habPING = false; //variable para habilitar o no un mensaje PING
+
+
+//
+// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
+OneWire oneWire(ONE_WIRE_BUS);
+
+// Pass our oneWire reference to Dallas Temperature. 
+DallasTemperature sensors(&oneWire);
+
+int numberOfDevices; // Number of temperature devices found
+
+DeviceAddress tempDeviceAddress; // We'll use this variable to store a found device address
+
+float temperatura;
+
+//
+
+
 void setup() {
   // put your setup code here, to run once:
+  delay(5000);
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, RXD1, TXD1);
+
+
+  /*
+  pinMode(pinRele,OUTPUT);
+  digitalWrite(pinRele,0);*/
+  confGPIOs();
+
+  //Inicializamos el GPIO del botton integrado (si es que está disponible)
+  //pinMode(pinBtn,INPUT);
+
+  timersInit();
+
+
+  sensors.begin();
+  sensors.getAddress(tempDeviceAddress, 0);
+
+  sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
+  //Asignacion de int
+  //attachInterrupt(pinBtn, ISRbtn, FALLING);
+
+  Serial.println("Empezando Warmup");
+  mdmWarmUp();
+  
+
+  Serial.println("Inicializando MQTT");
+  byte resultado = initMQTT(0);
+  byte intRes = 0; //intentos restantes para ejecutar la misma subrutina
+
+  while((resultado < 8) && (intRes != INTENTOS)){
+    delay(60000); //esperamos 1 minuto a reintentar
+    intRes++;
+    resultado = initMQTT(resultado);
+      //Si entramos en modo OTA
+  if(OTA){
+
+    ModoOTA();
+
+  }
+  }
+
+  //al salir si intRes es igual a INTENTOS se reinicia el ESP32
+  if(intRes == INTENTOS){
+    ESP.restart();
+  }else{
+    intRes = 0; //Si no reiniciamos variable
+  }
+  
+  delay(1000);
+
+  Serial.println("Iniciando Suscripcion");
+
+  while((!subMQTT(MQTT_SUBTOPIC)) && (intRes != INTENTOS)){
+    delay(60000); //esperamos 1 minuto a reintentar
+    intRes++;
+      //Si entramos en modo OTA
+  if(OTA){
+
+    ModoOTA();
+
+  }
+  }
+
+  //al salir si intRes es igual a INTENTOS se reinicia el ESP32
+  if(intRes == INTENTOS){
+    ESP.restart();
+  }else{
+    intRes = 0; //Si no reiniciamos variable
+  }
+
+  
+  Serial.println("Listo");
+
+  MQTTconectado = true;
+
+  Serial1.println("AT+CSQ");
+  Serial1.find("+CSQ: ");
+  String senial = Serial1.readStringUntil(',');
+
+
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempC(tempDeviceAddress);
+  pubMQTT("{\"estado\":\"INICIO\",\"senial\":"+senial+",\"temp\":"+String(tempC)+"}");
+
+  Serial1.readString(); //Limpieza del buffer
+
+  
+
+
+
 
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
+
+void loop(){
+
+  //Si entramos en modo OTA
+  if(OTA){
+
+    ModoOTA();
+
+  }
+
+
+  if(Serial1.available() > 0){
+    //Significa que el modem recibio algo, se decodifica qué es 
+
+    Serial1.find("+"); //Nos ponemos al inicio de la respuesta del modem 
+
+    modemAT = Serial1.readStringUntil(':');
+
+    Serial.println(); //OPCIONAL quitar, solo para formato de pruebas
+    Serial.println(modemAT);
+
+    if(modemAT == "CMQTTRXSTART"){
+      //Entonces se trata de un payload por parte del HOST
+
+      accionMQTT(decodificarComando());
+
+    }else{//else if(Serial1.find("CMQTTNONET")){
+      //Vamos a buscar entonces si hay un +CMQTTNONET que indique desconexión del servicio
+      Serial1.readString(); //LImpieza de buffer
+
+      Serial.println("Se perdio la conexion a MQTT se reintentará la conexión"); 
+      
+      MQTTconectado = false; //Indicamos que no estamos conectados
+
+      
+  
+    }
+  }
+
+
+  //seccion para envios de ping constantes
+  if(habPING){
+
+    habPING = false;
+    Serial1.println("AT+CSQ");
+    Serial1.find("+CSQ: ");
+    String senial = Serial1.readStringUntil(',');
+
+    sensors.requestTemperatures();
+    float tempC = sensors.getTempC(tempDeviceAddress);
+
+    pubMQTT("{\"estado\":\"PING\",\"senial\":"+senial+",\"temp\":"+String(tempC)+"}");
+
+    Serial1.readString(); //Limpieza del buffer
+
+  }
+  //Seccion que se encarga de ver si es que se debe  hacer un reinicio al WattWatcher
+  if(reinicioSerie || reinicioInt ){
+    //Si cualquiera de los dos triggers indica reinicio de wattWatcher se reinicia
+    String tipoD = "";
+    if(reinicioInt){
+      Serial.println("Reinicio por INT");
+      tipoD = "REINICIO DE WW POR INT";
+    }
+
+    if(reinicioSerie){
+      Serial.println("Reinicio por MQTT");
+      tipoD = "REINICIO DE WW POR MQTT";
+    }
+
+    
+
+    reinicioSerie = false;
+    reinicioInt = false;
+
+
+    /*timerWrite(tAux, 32000000); //cargamos registro del timer con 32 segundos 
+    * timerStart(tAux); //empezamos cuenta*/
+
+    //Encendemos rele
+    digitalWrite(pinRele,1);
+
+    delay(31000);
+    /* /esperamos 30s
+    while(timerRead(tAux) > 10000){
+
+    }
+    */
+
+    //Apagamos rele
+    digitalWrite(pinRele,0);
+
+
+    
+    Serial1.println("AT+CSQ");
+    Serial1.find("+CSQ: ");
+    String senial = Serial1.readStringUntil(',');
+
+    sensors.requestTemperatures();
+    float tempC = sensors.getTempC(tempDeviceAddress);
+
+    pubMQTT("{\"estado\":\""+tipoD+"\",\"senial\":"+senial+",\"temp\":"+String(tempC)+"}");
+
+    Serial1.readString(); //Limpieza del buffer
+    
+    
+
+    //timerStop(tAux);
+    
+
+
+
+
+
+
+  }
+
+  //Seccion que se encarga de hacer la reconexion del dispositivo al MQTT
+  if(!MQTTconectado && habReconexion){
+    //Si estamos desconectados...
+
+    /*
+    * Se le da un reinicio al modem y se reintenta 
+    *
+    */
+      Serial.println("Intentando reconexion");
+      habReconexion = false;
+      warmUpSuave();
+
+      byte resultado = initMQTT(0);
+      byte intRes = 0; //intentos restantes para ejecutar la misma subrutina
+
+      while((resultado < 8) && (intRes != INTENTOS)){
+        delay(30000); //esperamos 1 minuto a reintentar
+        intRes++;
+        resultado = initMQTT(resultado);
+      }
+
+      //al salir si intRes es igual a INTENTOS se reinicia el ESP32
+      if(intRes == INTENTOS){
+        MQTTconectado = false;
+      }else{
+        intRes = 0; //Si no reiniciamos variable
+        MQTTconectado = true;
+        
+      }
+
+      if(MQTTconectado){
+        //Si el anterior paso se logro iniciamos suscripcion
+        while((!subMQTT(MQTT_SUBTOPIC)) && (intRes != INTENTOS)){
+          delay(30000); //esperamos 1 minuto a reintentar 
+          intRes++;
+        }
+
+        //al salir si intRes es igual a INTENTOS se reinicia el ESP32
+        if(intRes ==   INTENTOS){
+          MQTTconectado = false;
+        }else{
+          MQTTconectado = true;
+          Serial1.println("AT+CSQ");
+          Serial1.find("+CSQ: ");
+          String senial = Serial1.readStringUntil(',');
+
+          sensors.requestTemperatures();
+          float tempC = sensors.getTempC(tempDeviceAddress);
+
+          pubMQTT("{\"estado\":\"RECONEXION\",\"senial\":"+senial+",\"temp\":"+String(tempC)+"}");
+
+          Serial1.readString(); //Limpieza del buffer
+        }
+      }else{
+        //no se continua con el proceso y se indica
+        MQTTconectado = false;
+
+      }
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+  }
+
+
+
+
+
 
 }
+
+
+
+//Vamos a devolver true si es que el warmup del modem fue correcto
+/* En esta implementacion del warmup se verifica que la configuración sea correcta 
+* si no lo es se da la configuracion correcta 
+*/  
+bool mdmWarmUp(){
+
+  //Agregamos un timeout de 30s, el modem toma alrededor de 20s una vez se ha energizado para empezar a
+  //recibir comandos AT de forma efectiva 
+  Serial1.setTimeout(30000);
+  Serial.println("COMENZAMOS");
+  //Buscamos la cadena 'RDY' ya que es la respuesta que entrega el modem al reiniciarse
+  if(!Serial1.find("RDY")){
+    //Si caemos en este bloque significa que el mdoem ya se encontraba encendido
+    Serial.println("RDY");
+  }
+  //1.- Reiniciar el modem a configuracion predeterminada
+  Serial1.setTimeout(1000);
+  Serial1.readString();
+  Serial1.println("AT+CFUN=1,1");
+
+
+  //Vamos a esperar a que el modem responda 
+  while(Serial1.available() < 50){}
+
+
+  Serial1.readString(); //<- ESTE NO, FUNCIONA PARA LIMPIAR EL BUFFER
+
+
+  
+
+  //2.- DESACTIVAR ECHO DE LOS COMANDOS
+  /*Si no existe respuesta correcta se trata de nuevo el comando hasta lo que indique INTENTOS
+  * Si en esos intentos no se pudo se sale 
+  * Este se hace si o si en el warmup
+  */
+  modemComando("ATE0");
+
+  Serial1.readString();//Limpiamos buffer
+
+
+
+  //3.- HORA Y FECHA AUTOMATICAS 
+  Serial1.println("AT+CTZU?"); //preguntamos que configuracion tiene el modem
+  
+  while(Serial1.available() < 7){}
+
+  if(Serial1.find("+CTZU: 1")){
+    //No se hace anda es la respuesta que se busca, se limpia buffer
+    Serial.println("Hora y fecha automaticas ya estaba configurado");
+    Serial1.readString();
+  }else{
+    //Se manda el comando para ser configurado
+    if(!modemComando("AT+CTZU=1")){
+      Serial.println("\nNo se pudo configurar fecha y hora automaticas");
+    }
+  }
+  
+
+  //4.- CHECAR MODEM CON CARRIER AUTOMATICO
+  Serial1.println("AT+COPS?");
+  while(Serial1.available() < 7){}
+  if(Serial1.find("+COPS: 0")){
+    //No se hace anda es la respuesta que se busca
+    Serial.println("Carrier automatico ya estaba configurado");
+    Serial1.readString();
+  }else{
+    //Se manda el comando para ser configurado
+    if(!modemComando("AT+COPS=0")){
+      Serial.println("\nNo se pudo configurar carrier automatico");
+    }
+  }
+  
+
+  //5.- CHECAR APN CORRECTO
+  Serial1.println("AT+CGDCONT?");
+  while(Serial1.available() < 7){}
+  if(Serial1.find("+CGDCONT: 1,\"IP\",\"data.mono\"")){
+    //No se hace anda es la respuesta que se busca
+    Serial.println("APN ya estaba configurado");
+    Serial1.readString();
+  }else{
+    //Se manda el comando para ser configurado
+    if(!modemComando("AT+CGDCONT=1,\"IP\",\"data.mono\"")){
+      Serial.println("\nNo se pudo configurar APN");
+    }
+  }
+
+
+  //Al finalizar regresamos TRUE
+  return true;
+
+}
+
+//Funcion para enviar comandos al modem con reintentos
+bool modemComando(String AT){
+
+  //Variable que cuenta cuantos intentos se han llevado a cabo en un comando AT
+  byte mdmIntRestantes = 0;
+
+  Serial1.println(AT);
+
+  while(!Serial1.find("OK")){
+    Serial1.println(AT);
+   
+    if(++mdmIntRestantes == INTENTOS){
+      //Si se llega al maximo de intentos salimos del warmup
+      return false;
+    }
+    //Nos esperamos un momento para realizar un nuevo intento
+    delay(200);//CAMB se puede usar otra base de tiempo si esta no funciona
+  }
+  //Limpiamos el buffer Serial
+  Serial1.readString();
+
+  return true;
+  
+
+}
+
+/*
+* Se regresa un numero entero del 0 al 2 que denota en que paso fallo la inicializacion
+* y se retomara a a partir de ahi en el siguiente intento
+*/
+byte initMQTT(byte paso){
+
+
+  switch(paso){
+
+    case 0:
+      //Incializamos el MQTT en el modem
+      Serial1.println("AT+CMQTTSTART");
+      while(Serial1.available() < 11){}
+
+      //Comprobacion del inicio del MQTT
+      if(Serial1.find("+CMQTTSTART: 0")){
+        Serial.println("\n0.- MQTT INICIADO");
+      }else{
+        Serial.println("\n0.- MQTT NO INICIADO");
+        return 0;
+      }
+      Serial1.readString();// Limpiar el buffer
+      //-------------------------------
+      
+    case 1:
+
+      //Configuramos ID del MQTT
+      Serial1.println("AT+CMQTTACCQ=0,\""+String(MQTT_ID)+"\"");//Configuramos ID para MQTT dado por Losant
+      while(Serial1.available() < 2){}
+      //Comprobacion de la configuracion del ID
+      if(Serial1.find("OK")){
+        Serial.println("\n1.- ID ASIGNADO");
+      }else{
+        Serial.println("\n1.- ID NO ASIGNADO");
+        return 1;
+      }
+      Serial1.readString();// Limpiar el buffer
+      //-------------------------------
+
+    case 2:
+
+      //Nos conectamos al broker de Losant
+      Serial1.println("AT+CMQTTCONNECT=0,\"tcp://"+String(MQTT_HOST)+":"+String(MQTT_PUERTO)+"\",60,1,\""+String(MQTT_USER)+"\",\""+String(MQTT_PASS)+"\"");
+
+      while(Serial1.available() < 13){}
+
+      //Comprobacion de la conexion al broker
+      if(Serial1.find("+CMQTTCONNECT: 0,0")){
+        Serial.println("\n2.- CONECTADO A BROKER");
+      }else{
+        Serial.println("\n2.- NO CONECTADO A BROKER");
+        return 2;
+      }
+      Serial1.readString();// Limpiar el buffer
+      //-------------------------------
+
+    default:
+      break;
+  }
+
+  return 8; //Si todo sale bien devolvemos 8
+
+
+
+}
+
+//regresamos true si logramos suscribirnos a tema
+bool subMQTT(String tema){
+
+  //-------------------------------
+  //Configuramos tema de suscripcion
+  Serial1.println("AT+CMQTTSUBTOPIC=0,"+String(tema.length())+",1");
+  delay(10);
+  Serial1.print(tema);
+  while(Serial1.available() < 2){}
+  //Comprobacion de la suscripcion al tema
+  if(Serial1.find("OK")){
+    Serial.println("\n1.- Tema de suscripcion configurado");
+  }else{
+    Serial.println("\n1.- Tema de suscripcion NO configurado");
+    //EXPLORAR LA POSIBILIDAD DE SALIR AQUI
+    return false;
+  }
+  Serial1.readString();// Limpiar el buffer
+
+  //-------------------------------
+  //Configuramos tema de suscripcion parte 2
+  Serial1.println("AT+CMQTTSUB=0");
+  while(Serial1.available() < 8){}
+
+
+  //Comprobacion del segundo paso
+  if(Serial1.find("+CMQTTSUB: 0,0")){
+    Serial.println("\n2.- Preparando tema de suscripcion");
+  }else{
+    Serial.println("\n2.- NO Preparando tema de suscripcion");
+    return false;
+  }
+  Serial1.readString();// Limpiar el buffer
+
+  //-------------------------------
+  //Configuramos tema de suscripcion parte 3
+  Serial1.println("AT+CMQTTSUB=0,"+String(tema.length())+",0");
+  delay(10); //CAMBIAR base de tiempo
+  Serial1.print(tema);
+  while(Serial1.available() < 8){}
+
+  //Comprobacion del segundo paso
+  if(Serial1.find("+CMQTTSUB: 0,0")){
+    Serial.println("\n3.- Suscrito a tema: "+tema);
+  }else{
+    Serial.println("\n3.- NO Suscrito a tema: "+tema);
+    return false;
+  } 
+  Serial1.readString();// Limpiar el buffer
+
+  //si todo sale bien regresamos true
+  return true;
+
+}
+
+//funcion para solor econectarse a servicio MQTT
+bool reconMQTT(){
+
+  //Incializamos el MQTT en el modem
+  Serial1.println("AT+CMQTTSTART");
+  while(Serial1.available() < 11){}
+
+  //Comprobacion del inicio del MQTT
+  if(Serial1.find("+CMQTTSTART: 0")){
+    Serial.println("\nMQTT REINICIADO");
+  }else{
+    Serial.println("\nMQTT NO REINICIADO");
+    return false;
+  }
+  Serial1.readString();// Limpiar el buffer
+  //-------------------------------
+
+  //Configuramos ID del MQTT
+  Serial1.println("AT+CMQTTACCQ=0,\""+String(MQTT_ID)+"\"");//Configuramos ID para MQTT dado por Losant
+  while(Serial1.available() < 2){}
+  //Comprobacion de la configuracion del ID
+  if(Serial1.find("OK")){
+    Serial.println("\n1.- ID ASIGNADO");
+  }else{
+    Serial.println("\n1.- ID NO ASIGNADO");
+    return false;
+  }
+  Serial1.readString();// Limpiar el buffer
+  //-------------------------------
+
+  //Nos conectamos al broker de Losant
+  Serial1.println("AT+CMQTTCONNECT=0,\"tcp://"+String(MQTT_HOST)+":"+String(MQTT_PUERTO)+"\",60,1,\""+String(MQTT_USER)+"\",\""+String(MQTT_PASS)+"\"");
+
+  while(Serial1.available() < 13){}
+
+  //Comprobacion de la conexion al broker
+  if(Serial1.find("+CMQTTCONNECT: 0,0")){
+    Serial.println("\n2.- RECONECTADO A BROKER");
+  }else{
+    Serial.println("\n2.- NO RECONECTADO A BROKER");
+    return false;
+  }
+  Serial1.readString();// Limpiar el buffer
+  //-------------------------------
+
+  //Si todo sale bien regresamos true
+  return true;
+
+}
+
+//Subrutina para desonectarse del servicio MQTT
+void disMQTT(){
+  Serial1.setTimeout(1000);
+
+  //1.- Mandamos mensaje de desconexion
+  Serial1.println("AT+CMQTTDISC=0,120");
+  delay(5000); //CAMBIAR base de tiempo, delay de cinco segundos
+  //Comprobacion de la desconexion al broker
+  if(Serial1.find("+CMQTTDISC: 0,0")){
+    Serial.println("\nDESCONECTADO A BROKER");
+  }else{
+
+  }
+  //-------------------------------
+  //2.- 'Soltamos' (release) el cliente
+  Serial1.println("AT+CMQTTREL=0");
+
+  //Comprobacion de la desconexion al broker
+  if(Serial1.find("OK")){
+    Serial.println("\nCLIENTE LIBERADO");
+  }else{
+
+  }
+
+  //-------------------------------
+  //3.- 'Soltamos' (release) el cliente
+  Serial1.println("AT+CMQTTSTOP");
+
+  String cepillo = Serial1.readString();
+
+  /*/Comprobacion de la desconexion al broker
+  if(Serial1.find("OK")){
+    Serial.println("\nMQTT DETENIDO");
+  }else{
+
+  }*/
+
+  Serial.println(cepillo);
+
+
+}
+
+
+void ISRbtn(){
+  
+  /*
+  * Sirve para desconectarse de manera correcta del Broker
+  *
+  * Implementado por interrupcion de boton de la board (ESP32THING)
+  */
+
+  //desMQTT = true;
+
+}
+
+/*
+void ISR_reconexion(){
+
+  habReconexion = true; //permitimos intento de reconexion
+
+  //habPING = true; //Habilitamos envio de PING
+
+}
+*/
+void timersInit(){
+
+  tReinicio = timerBegin(0, 80, true);//HW timer 0, divisor de 80, cuenta arriba
+  tLED = timerBegin(1, 80, true); //HW timer 1, divisor de 80, cuenta arriba
+  tWD = timerBegin(2, 80, true); //HW timer 2, divisor de 80, cuenta arriba
+
+  timerAttachInterrupt(tReinicio, &ISRtReinicio, true);//configuramos INT del reinicio periodico
+  timerAttachInterrupt(tLED, &ISRtLED, true);//configuramos INT del reinicio periodico
+  timerAttachInterrupt(tWD, &ISRtWatchDogOTA, true);//configuramos INT del modo OTA
+
+  //Timer de alarma
+  timerAlarmWrite(tReinicio, 3600000000, true); // configuramos el tiempo para reinicio (1 hr)
+  timerAlarmEnable(tReinicio); //Habilitamos timer 
+
+  /*/Timer de habilitacion de reintento de reconexion (y ping)
+  timerAlarmWrite(tMonitoreo, 600000000, true); // configuramos el tiempo para reinicio (10 min)
+  timerAlarmEnable(tMonitoreo); //Habilitamos timer */
+  //Timer de parpadeo de LED
+  timerAlarmWrite(tLED, 1000000, true); // parpadeo normal led de 1s
+  timerAlarmEnable(tLED); //Habilitamos timer 
+
+  //Timer de confirmacion de entarar a modo OTA
+  timerAlarmWrite(tWD, 3000000, true); // parpadeo normal led de 1s
+  
+  Serial.println("TIMERS CONFIGURADOS Y CORRIENDO");
+
+} 
+
+
+bool warmUpSuave(){
+
+
+  Serial1.readString();// limpiamos cualquier cosa que este en buffer para evitar fallos
+  Serial1.println("AT+CFUN=1,1");
+
+
+  //Vamos a esperar a que el modem responda 
+  while(Serial1.available() < 50){}
+
+
+  Serial1.readString(); //<- ESTE NO, FUNCIONA PARA LIMPIAR EL BUFFER
+
+
+  
+
+  //2.- DESACTIVAR ECHO DE LOS COMANDOS
+  /*Si no existe respuesta correcta se trata de nuevo el comando hasta lo que indique INTENTOS
+  * Si en esos intentos no se pudo se sale 
+  * Este se hace si o si en el warmup
+  */
+  modemComando("ATE0");
+
+  Serial1.readString();//Limpiamos buffer
+
+
+
+  //3.- HORA Y FECHA AUTOMATICAS 
+  Serial1.println("AT+CTZU?"); //preguntamos que configuracion tiene el modem
+  
+  while(Serial1.available() < 7){}
+
+  if(Serial1.find("+CTZU: 1")){
+    //No se hace anda es la respuesta que se busca, se limpia buffer
+    Serial.println("Hora y fecha automaticas ya estaba configurado");
+    Serial1.readString();
+  }else{
+    //Se manda el comando para ser configurado
+    if(!modemComando("AT+CTZU=1")){
+      Serial.println("\nNo se pudo configurar fecha y hora automaticas");
+    }
+  }
+  
+
+  //4.- CHECAR MODEM CON CARRIER AUTOMATICO
+  Serial1.println("AT+COPS?");
+  while(Serial1.available() < 7){}
+  if(Serial1.find("+COPS: 0")){
+    //No se hace anda es la respuesta que se busca
+    Serial.println("Carrier automatico ya estaba configurado");
+    Serial1.readString();
+  }else{
+    //Se manda el comando para ser configurado
+    if(!modemComando("AT+COPS=0")){
+      Serial.println("\nNo se pudo configurar carrier automatico");
+    }
+  }
+  
+
+  //5.- CHECAR APN CORRECTO
+  Serial1.println("AT+CGDCONT?");
+  while(Serial1.available() < 7){}
+  if(Serial1.find("+CGDCONT: 1,\"IP\",\"data.mono\"")){
+    //No se hace anda es la respuesta que se busca
+    Serial.println("APN ya estaba configurado");
+    Serial1.readString();
+  }else{
+    //Se manda el comando para ser configurado
+    if(!modemComando("AT+CGDCONT=1,\"IP\",\"data.mono\"")){
+      Serial.println("\nNo se pudo configurar APN");
+    }
+  }
+
+
+  //Al finalizar regresamos TRUE
+  return true;
+
+}
+
+void ISRtWatchDogOTA(){
+  //Esta ISR se encarga de validar que se cumplio
+  //el tiempo requerido de reed switch para entrar en modo OTA
+  //y para sacarlo en caso de que pase mucho tiempo
+
+  if(OTA){
+    //Si estamos en modo ota cuando se mande a llamar esta interrupción debemos de salir de ahí
+    //En esta version se hara un reinicio del sistema 
+    ESP.restart();
+  }else{
+    //si estamos contando los segundos para activar el modo OTA
+    //al llegar a esta interrupcion activamos la bandera 
+    if(digitalRead(pinReedSw) == 0){
+      //entonces significa que se mantuvo el tiempo necesario
+      OTA = true; //Activamos modo OTA
+      timerAlarmWrite(tWD, 1000000*60*5, true); // watchdog de 5 mins
+      timerAlarmWrite(tLED, LedOpOTA, true); // parpadeo de LED indicando modo OTA
+      timerRestart(tLED);
+      timerStart(tLED);
+      timerRestart(tWD);
+      timerStart(tWD);
+      timerAlarmEnable(tLED); //Habilitamos time
+
+
+    }
+    
+
+
+  }
+}
+
+void ISRtLED(){
+  //Solo se cambia el estado del LED para que parpadee
+  digitalWrite(pinLED,!digitalRead(pinLED));
+}
+
+void ISRtReinicio(){
+  //subrutina para reinicio periodico de WattWatcher
+
+  //cada que se llame esta subrutina habilitaremos el reinicio del wattwathcer
+  horasReinicio++;
+  habReconexion = true; //Habilitamos reconexion cada hora
+
+  if(horasReinicio == hrspReinicio){
+
+    horasReinicio = 0;
+    reinicioInt = true;
+
+  }
+  
+  
+
+}
+
+//para publicar un mensaje a tema configurado en el inciio del codigo
+void pubMQTT(String mensaje){
+
+  //-------------------------------
+  //Configuramos tema de publicacion
+  Serial1.println("AT+CMQTTTOPIC=0,"+String(String(MQTT_DEVICEPUB).length()));
+  delay(10);
+  Serial1.print(MQTT_DEVICEPUB);
+  while(Serial1.available() < 2){}
+  //Comprobacion de la suscripcion al tema
+  if(Serial1.find("OK")){
+    Serial.println("\n1.- Tema de publicacion configurado");
+  }else{
+    Serial.println("\n1.- Tema de publicacion NO configurado");
+    //si es que se falla en este paso lo mas probable es que estemos desconectados
+    MQTTconectado = false;
+    //EXPLORAR LA POSIBILIDAD DE SALIR AQUI
+    Serial1.readString();// Limpiar el buffer
+    return;
+  }
+  Serial1.readString();// Limpiar el buffer
+
+  //-------------------------------
+  //Configuramos payload
+  Serial1.println("AT+CMQTTPAYLOAD=0,"+String(mensaje.length()));
+  delay(10);
+  Serial1.print(mensaje);
+  while(Serial1.available() < 2){}
+  //Comprobacion del payload
+  if(Serial1.find("OK")){
+    Serial.println("\n2.- Payload configurado");
+  }else{
+    Serial.println("\n2.- Payload NO configurado");
+    //si es que se falla en este paso lo mas probable es que estemos desconectados
+    MQTTconectado = false;
+    Serial1.readString();// Limpiar el buffer
+    //EXPLORAR LA POSIBILIDAD DE SALIR AQUI
+    return;
+  }
+  Serial1.readString();// Limpiar el buffer
+
+  //-------------------------------
+  //Publicamos cosa
+  Serial1.println("AT+CMQTTPUB=0,1,60");
+  while(Serial1.available() < 13){}
+
+  //Comprobacion del payload
+  if(Serial1.find("+CMQTTPUB: 0,0")){
+    Serial.println("\n3.- Mensaje enviado");
+  }else{
+    Serial.println("\n3.- Mensaje NO enviado");
+    //si es que se falla en este paso lo mas probable es que estemos desconectados
+    MQTTconectado = false;
+    Serial1.readString();// Limpiar el buffer
+    //EXPLORAR LA POSIBILIDAD DE SALIR AQUI
+    return;
+  }
+  Serial1.readString();// Limpiar el buffer
+
+  //si todo sale bien regresamos true
+  
+
+}
+
+
+uint16_t decodificarComando(){
+
+  /*
+  *
+  * Funcion para decodificar los comandos recibidos a través del Broker de Losant
+  * Devuelve la acción que debe efectuarse basado en el comando enviado
+  *
+  * Los comandos implementados hasta el momento son:
+  * 1.- $CFGHORA@HH
+  *     HH: Hora en formato de 24h
+  *
+  * 2.- $CFGPER@DD
+  *     DD: Días que transcurren entre reinicios periodicos
+  *
+  * 3.- $RE@
+  *     Da la instruccion de hacer el reinicio 
+  *
+  * 4.- $PING@
+  *     Solicitamos estado de conexion del dispositivo
+  */
+
+  //Nos acercamos al inicio del comando buscando nuestro caracter de inicio '$'
+  Serial1.find('$');
+
+  //Ahora estamos al inicio del comando, lo leemos
+  String comando = Serial1.readStringUntil('@');
+
+  if(comando == "CFGHORA"){
+    //Se trata de una configuracion de hora, se obtiene a que hora se requiere el reinicio
+    Serial.println();
+    Serial.println("Configuracion de hora");
+
+    //Rescatamos la hora 
+    cfgHora = Serial1.parseInt();
+
+    Serial.print("Hora de reinicio:");
+
+    Serial.println(cfgHora);
+
+    //Limpiamos buffer
+    Serial1.readString();
+
+
+
+
+
+  }else if(comando == "CFGPER"){
+
+  }else if(comando == "CFGPING"){
+
+  }else if(comando == "RE"){
+
+    Serial.println("Reinicio pendiente");
+
+    //Limpieza de buffer
+    Serial1.readString();
+
+    return MQTT_REINICIO;
+
+  }else if(comando == "PING"){
+
+    Serial.println();
+    Serial.println("Comprobando estado de conectividad");
+    Serial1.readString();
+
+    return MQTT_PING;
+
+  }else{
+    Serial.println("COMANDO NO DETECTADO");
+
+    return MQTT_NOACCION;
+
+  }
+
+
+
+
+}
+
+bool accionMQTT(uint16_t com){
+
+  switch(com){
+
+    case MQTT_REINICIO: 
+      //Habilitamos el reinicio
+      reinicioSerie = true; 
+      break;
+    
+    case MQTT_PING:
+      //Habilitamos ping
+      habPING = true;
+      break;
+    /*case
+      break;
+    case
+      break;
+    case
+      break;*/
+    
+    default:
+      Serial.println("Sin accion, comando desconocido");
+
+      return false;
+      //break;
+
+  }
+  return true;
+}
+
+void ModoOTA(){
+
+  //Funcion para configurar y entrar en modo OTA
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    //esperamos 5s para intentar reconexión    
+    delay(5000);
+  }
+  
+  ArduinoOTA.setPort(3232);
+
+  ArduinoOTA
+  .onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else // U_SPIFFS
+      type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+    });
+    
+  ArduinoOTA.begin();
+
+  while(1){
+    ArduinoOTA.handle();
+  }
+
+
+
+}
+
+void ISRReedSw(){
+  //esta interrupción se "dispara" con cualquier cambio en el flanco
+
+  //primero verificamos si la interrupción se disparo para entrar a modo ota
+  //en ese casoe l contador de segundos esta en 0
+  if(!OTA){
+    //Si estamos empezando  a  entrar en modo OTA activamos timer 
+
+    if(digitalRead(pinReedSw) == 0){
+      //significa que el imán está presente
+      timerRestart(tWD);// Reiniciamos la cuenta del timer a 0
+      timerStart(tWD);
+      timerAlarmEnable(tWD);
+
+      //Apagamos timer del LED y lo dejamos "encendido"
+      timerStop(tLED);
+      digitalWrite(pinLED,LedOpTrans);
+    }else{
+      //el imán no está presente
+      timerRestart(tLED);
+      timerStart(tLED);
+      timerStop(tWD);
+    }
+
+
+
+  }else{
+    //si ya activamos el modo OTA 
+
+
+
+  }
+
+
+}
+
+//Subrutina para configurar entradas y salidas
+void confGPIOs(){
+
+  //Configuramos el relé como salida
+  pinMode(pinRele,OUTPUT);
+  //Apagamos relé
+  digitalWrite(pinRele,0);
+
+
+  //Configuramos LED indicador como salida 
+  pinMode(pinLED,OUTPUT);
+  //Apagamos el LED 
+  digitalWrite(pinLED,0);
+
+  //Configuramos como entrada el reed switch con resistencia pull-up
+  pinMode(pinReedSw,INPUT_PULLUP);
+
+
+  //Activamos interrupcióin a GPIO de reed switch
+  attachInterrupt(pinReedSw, ISRReedSw, CHANGE);
+
+}
+
+
+// function to print the temperature for a device
+void printTemperature(DeviceAddress deviceAddress){
+  // method 1 - slower
+  //Serial.print("Temp C: ");
+  //Serial.print(sensors.getTempC(deviceAddress));
+  //Serial.print(" Temp F: ");
+  //Serial.print(sensors.getTempF(deviceAddress)); // Makes a second call to getTempC and then converts to Fahrenheit
+
+  // method 2 - faster
+  float tempC = sensors.getTempC(deviceAddress);
+  if(tempC == DEVICE_DISCONNECTED_C) 
+  {
+    Serial.println("Error: Could not read temperature data");
+    return;
+  }
+  Serial.print("Temp C: ");
+  Serial.print(tempC);
+  Serial.print(" Temp F: ");
+  Serial.println(DallasTemperature::toFahrenheit(tempC)); // Converts tempC to Fahrenheit
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
